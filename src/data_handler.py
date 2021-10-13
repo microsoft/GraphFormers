@@ -1,11 +1,9 @@
-import random
 import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Callable, Union
 from torch.utils.data.dataset import IterableDataset
 import torch
 import torch.distributed as dist
-from torch.nn.utils.rnn import pad_sequence
 from queue import Queue
 
 from transformers.utils import logging
@@ -34,8 +32,10 @@ class DatasetForMatching(IterableDataset):
         # Balanced Multifilter Banks for Multiple Description Coding|'|Balanced multiwavelets|'|On minimal lattice factorizations of symmetric-antisymmetric multifilterbanks|'|High-order balanced multiwavelets: theory, factorization, and design|'|Single-Trial Multiwavelet Coherence in Application to Neurophysiological Time Series|'|The application of multiwavelet filterbanks to image processing	Armlets and balanced multiwavelets: flipping filter construction|'|Multiwavelet prefilters. II. Optimal orthogonal prefilters|'|Regularity of multiwavelets|'|Balanced GHM-like multiscaling functions|'|A new prefilter design for discrete multiwavelet transforms|'|Balanced multiwavelets with short filters
 
         query_and_neighbors, key_and_neighbors = input_line.strip('\n').split('\t')[:2]
-        tokens_query_and_neighbors=self.tokenizer.batch_encode_plus(query_and_neighbors,add_special_tokens=False)
-        tokens_key_and_neighbors=self.tokenizer.batch_encode_plus(key_and_neighbors,add_special_tokens=False)
+        query_and_neighbors=query_and_neighbors.split('|\'|')
+        key_and_neighbors=key_and_neighbors.split('|\'|')
+        tokens_query_and_neighbors=self.tokenizer.batch_encode_plus(query_and_neighbors,add_special_tokens=False)['input_ids']
+        tokens_key_and_neighbors=self.tokenizer.batch_encode_plus(key_and_neighbors,add_special_tokens=False)['input_ids']
 
         return tokens_query_and_neighbors,tokens_key_and_neighbors
 
@@ -51,6 +51,7 @@ class DataCollatorForMatching:
     token_length: int
     tokenizer: Union[BertTokenizerFast, str] = "bert-base-uncased"
     mlm_probability: float = 0.15
+    random_seed:int=42
 
     def __post_init__(self):
         if isinstance(self.tokenizer,str):
@@ -133,6 +134,9 @@ class DataCollatorForMatching:
                     mask_node_and_neighbors.append(torch.tensor(0))
                 else:
                     mask_node_and_neighbors.append(torch.tensor(1))
+            input_ids_node_and_neighbors=self._tensorize_batch(input_ids_node_and_neighbors,self.tokenizer.pad_token_id)
+            attention_mask_node_and_neighbors=self._tensorize_batch(attention_mask_node_and_neighbors,0)
+            mask_node_and_neighbors=torch.stack(mask_node_and_neighbors)
             return input_ids_node_and_neighbors, attention_mask_node_and_neighbors, mask_node_and_neighbors
 
         tokens_query_and_neighbors,tokens_key_and_neighbors = sample
@@ -142,42 +146,40 @@ class DataCollatorForMatching:
         return input_ids_query_and_neighbors,attention_mask_query_and_neighbors,mask_query_and_neighbors,\
                input_ids_key_and_neighbors,attention_mask_key_and_neighbors,mask_key_and_neighbors
 
-    # To be checked
     def mask_tokens(self, inputs_origin: torch.Tensor, mask_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare masked tokens inputs/labels for masked language modeling.
         """
         inputs = inputs_origin.clone()
-        labels = torch.zeros((inputs.shape[0]//(self.neighbor_num+1),inputs.shape[1]),dtype=torch.long)-100
-        num=0
-        for i, input_origin in enumerate(inputs_origin):
-            if i%(self.neighbor_num+1)!=0:continue
+        labels = torch.zeros((inputs.shape[0],inputs.shape[2]),dtype=torch.long)-100
+        for i in range(len(inputs_origin)):
+            input_origin=inputs_origin[i][0]
+            input=inputs[i][0]
             mask_num, valid_length = 0, 0
             start_indexes=[]
             for index, x in enumerate(input_origin):
                 if int(x) not in self.tokenizer.all_special_ids:
                     valid_length += 1
                     start_indexes.append(index)
-                    labels[num][index] = -99
-            random.shuffle(start_indexes)
+                    labels[i][index] = -99
+            self.random_state.shuffle(start_indexes)
             if valid_length>0:
                 while mask_num / valid_length < self.mlm_probability:
                     start_index = start_indexes.pop()
                     span_length = 1e9
                     while span_length > 10: span_length = np.random.geometric(0.2)
                     for j in range(start_index, min(start_index+span_length,len(input_origin))):
-                        if labels[num][j] != -99: continue
-                        labels[num][j] = input_origin[j].clone()
-                        rand=np.random.random()
+                        if labels[i][j] != -99: continue
+                        labels[i][j] = input_origin[j].clone()
+                        rand=self.random_state.random()
                         if rand<0.8:
-                            inputs[i][j] = mask_id
+                            input[j] = mask_id
                         elif rand<0.9:
-                            inputs[i][j]=np.random.randint(0,self.tokenizer.vocab_size-1)
+                            input[j]=self.random_state.randint(0,self.tokenizer.vocab_size-1)
                         mask_num += 1
                         if mask_num / valid_length >= self.mlm_probability:
                             break
-            labels[num] = torch.masked_fill(labels[num], labels[num] < 0, -100)
-            num+=1
+            labels[i] = torch.masked_fill(labels[i], labels[i] < 0, -100)
         return inputs, labels
 
 
