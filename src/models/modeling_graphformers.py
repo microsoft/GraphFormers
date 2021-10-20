@@ -1,10 +1,15 @@
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .tnlrv3.modeling import TuringNLRv3PreTrainedModel, logger, BertSelfAttention, BertSelfOutput, BertIntermediate, \
-    BertOutput, BertLayer, WEIGHTS_NAME, BertEmbeddings, relative_position_bucket
-from .tnlrv3.convert_state_dict import get_checkpoint_from_transformer_cache, state_dict_convert
+
+from src.models.tnlrv3.convert_state_dict import get_checkpoint_from_transformer_cache, state_dict_convert
+from src.models.tnlrv3.modeling import TuringNLRv3PreTrainedModel, logger, BertSelfAttention, BertLayer, WEIGHTS_NAME, \
+    BertEmbeddings, relative_position_bucket
+from src.utils import roc_auc_score, mrr_score, ndcg_score
+
 
 class GraphTuringNLRPreTrainedModel(TuringNLRv3PreTrainedModel):
     @classmethod
@@ -104,13 +109,8 @@ class GraphAggregation(BertSelfAttention):
     def __init__(self, config):
         super(GraphAggregation, self).__init__(config)
         self.output_attentions = False
-        self.mapping_graph = True if config.mapping_graph > 0 else False
-        if self.mapping_graph:
-            self.selfoutput = BertSelfOutput(config)
-            self.intermediate = BertIntermediate(config)
-            self.output = BertOutput(config)
 
-    def forward(self, hidden_states, attention_mask=None, rel_pos=None, activate_station=None):
+    def forward(self, hidden_states, attention_mask=None, rel_pos=None):
         """
         hidden_states[:,0] for the center node, hidden_states[:,1:] for the neighbours
         hidden_states: B SN D
@@ -127,15 +127,7 @@ class GraphAggregation(BertSelfAttention):
                                                   value=value,
                                                   attention_mask=attention_mask,
                                                   rel_pos=rel_pos)[0]  # B 1 D
-
-        if self.mapping_graph:
-            attention_output = self.selfoutput(station_embed, hidden_states[:, :1])
-            intermediate_output = self.intermediate(attention_output)
-            station_embed = self.output(intermediate_output, attention_output)
-
         station_embed = station_embed.squeeze(1)
-        if activate_station is not None:
-            station_embed = torch.mul(station_embed, activate_station.unsqueeze(1))
 
         return station_embed
 
@@ -159,7 +151,6 @@ class GraphBertEncoder(nn.Module):
                 node_mask=None,
                 node_rel_pos=None,
                 rel_pos=None,
-                activate_station=None,
                 return_last_station_emb=False):
         '''
         Args:
@@ -186,8 +177,8 @@ class GraphBertEncoder(nn.Module):
                     hidden_states = hidden_states.view(batch_size, subgraph_node_num, seq_length, emb_dim)  # B SN L D
                     cls_emb = hidden_states[:, :, 1].clone()  # B SN D
                     station_emb = self.graph_attention(hidden_states=cls_emb, attention_mask=node_mask,
-                                                       rel_pos=node_rel_pos, activate_station=activate_station)  # B D
-                    # station_emb = self.graph_attention[i-1](hidden_states=cls_emb, attention_mask=node_mask, rel_pos=node_rel_pos,activate_station=activate_station) #B D
+                                                       rel_pos=node_rel_pos)  # B D
+                    # station_emb = self.graph_attention[i-1](hidden_states=cls_emb, attention_mask=node_mask, rel_pos=node_rel_pos) #B D
 
                     # update the station in the query/key
                     hidden_states[:, 0, 0] = station_emb
@@ -245,7 +236,6 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
                 input_ids,
                 attention_mask,
                 neighbor_mask=None,
-                mask_self_in_graph=False,
                 return_last_station_emb=False):
         '''
         Args:
@@ -264,17 +254,12 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
         attention_mask = attention_mask.type(embedding_output.dtype)
         neighbor_mask = neighbor_mask.type(embedding_output.dtype)
         node_mask = None
-        activate_station = None
         if self.config.neighbor_type > 0:
             station_mask = torch.zeros(all_nodes_num, 1).type(attention_mask.dtype).to(attention_mask.device)  # N 1
             attention_mask = torch.cat([station_mask, attention_mask], dim=-1)  # N 1+L
             # only use the station for selfnode
             attention_mask[::(subgraph_node_num), 0] = 1.0
 
-            if mask_self_in_graph:
-                neighbor_mask[:, 0] = 0
-                activate_station = torch.sum(neighbor_mask, dim=-1)
-                activate_station = activate_station.masked_fill(activate_station > 0, 1)
             node_mask = (1.0 - neighbor_mask[:, None, None, :]) * -10000.0
 
         extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
@@ -309,7 +294,6 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
             rel_pos = F.one_hot(rel_pos, num_classes=self.config.rel_pos_bins + self.config.neighbor_type).type_as(
                 embedding_output)
             rel_pos = self.rel_pos_bias(rel_pos).permute(0, 3, 1, 2)
-            # rel_pos[:,:,:,0]=0
 
         else:
             node_rel_pos = None
@@ -327,75 +311,82 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
             node_mask=node_mask,
             node_rel_pos=node_rel_pos,
             rel_pos=rel_pos,
-            activate_station=activate_station,
             return_last_station_emb=return_last_station_emb)
 
         return encoder_outputs
+
 
 class GraphFormersForNeighborPredict(GraphTuringNLRPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.bert = GraphFormers(config)
-        if config.graph_transform > 0:
-            self.graph_transform = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.init_weights()
 
-    def retrieve_loss(self, q, k):
-        score = torch.matmul(q, k.transpose(0, 1))
-        loss = F.cross_entropy(score, torch.arange(start=0, end=score.shape[0],
-                                                   dtype=torch.long, device=score.device))
+    def infer(self, input_ids_node_and_neighbors_batch, attention_mask_node_and_neighbors_batch,
+              mask_node_and_neighbors_batch):
+        B, N, L = input_ids_node_and_neighbors_batch.shape
+        D = self.config.hidden_size
+        input_ids = input_ids_node_and_neighbors_batch.view(B * N, L)
+        attention_mask = attention_mask_node_and_neighbors_batch.view(B * N, L)
+        hidden_states = self.bert(input_ids, attention_mask, mask_node_and_neighbors_batch)
+        last_hidden_states = hidden_states[0]
+        cls_embeddings = last_hidden_states[:, 1].view(B, N, D)  # [B,N,D]
+        node_embeddings = cls_embeddings[:, 0, :]  # [B,D]
+        return node_embeddings
+
+    def compute_acc(scores, labels):
+        # hit num
+        prediction = torch.argmax(scores, dim=-1)  # N L
+        hit = (prediction == labels).float()  # N　L
+        hit = torch.sum(hit)
+
+        # all num
+        labels = labels.masked_fill(labels >= 0, 1)
+        labels = labels.masked_fill(labels < 0, 0)
+        labels = torch.sum(labels)
+
+        return hit, labels
+
+    def test(self, input_ids_query_and_neighbors_batch, attention_mask_query_and_neighbors_batch,
+             mask_query_and_neighbors_batch, \
+             input_ids_key_and_neighbors_batch, attention_mask_key_and_neighbors_batch, mask_key_and_neighbors_batch,
+             **kwargs):
+        query_embeddings = self.infer(input_ids_query_and_neighbors_batch, attention_mask_query_and_neighbors_batch,
+                                      mask_query_and_neighbors_batch)
+        key_embeddings = self.infer(input_ids_key_and_neighbors_batch, attention_mask_key_and_neighbors_batch,
+                                    mask_key_and_neighbors_batch)
+        scores = torch.matmul(query_embeddings, key_embeddings.transpose(0, 1))
+        labels = torch.arange(start=0, end=scores.shape[0], dtype=torch.long, device=scores.device)
+
+        predictions = torch.argmax(scores, dim=-1)
+        acc = (torch.sum((predictions == labels)) / labels.shape[0]).item()
+
+        scores = scores.cpu().numpy()
+        labels = F.one_hot(labels).cpu().numpy()
+        auc_all = [roc_auc_score(labels[i], scores[i]) for i in range(labels.shape[0])]
+        auc = np.mean(auc_all)
+        mrr_all = [mrr_score(labels[i], scores[i]) for i in range(labels.shape[0])]
+        mrr = np.mean(mrr_all)
+        ndcg_all = [ndcg_score(labels[i], scores[i], labels.shape[1]) for i in range(labels.shape[0])]
+        ndcg = np.mean(ndcg_all)
+
+        return {
+            "main": acc,
+            "acc": acc,
+            "auc": auc,
+            "mrr": mrr,
+            "ndcg": ndcg
+        }
+
+    def forward(self, input_ids_query_and_neighbors_batch, attention_mask_query_and_neighbors_batch,
+                mask_query_and_neighbors_batch, \
+                input_ids_key_and_neighbors_batch, attention_mask_key_and_neighbors_batch, mask_key_and_neighbors_batch,
+                **kwargs):
+        query_embeddings = self.infer(input_ids_query_and_neighbors_batch, attention_mask_query_and_neighbors_batch,
+                                      mask_query_and_neighbors_batch)
+        key_embeddings = self.infer(input_ids_key_and_neighbors_batch, attention_mask_key_and_neighbors_batch,
+                                    mask_key_and_neighbors_batch)
+        score = torch.matmul(query_embeddings, key_embeddings.transpose(0, 1))
+        labels = torch.arange(start=0, end=score.shape[0], dtype=torch.long, device=score.device)
+        loss = F.cross_entropy(score, labels)
         return loss
-
-    def forward(self,
-                input_ids_query,
-                attention_masks_query,
-                mask_query,
-                input_ids_key,
-                attention_masks_key,
-                mask_key,
-                neighbor_num,
-                mask_self_in_graph=False,
-                return_last_station_emb=False):
-
-        all_nodes_num = mask_query.shape[0]
-        batch_size = all_nodes_num // (neighbor_num + 1)
-        neighbor_mask_query = mask_query.view(batch_size, (neighbor_num + 1))
-        neighbor_mask_key = mask_key.view(batch_size, (neighbor_num + 1))
-
-        hidden_states_query = self.bert(input_ids_query, attention_masks_query,
-                                        neighbor_mask=neighbor_mask_query,
-                                        mask_self_in_graph=mask_self_in_graph,
-                                        return_last_station_emb=return_last_station_emb
-                                        )
-        hidden_states_key = self.bert(input_ids_key, attention_masks_key,
-                                      neighbor_mask=neighbor_mask_key,
-                                      mask_self_in_graph=mask_self_in_graph,
-                                      return_last_station_emb=return_last_station_emb
-                                      )
-        last_hidden_states_query = hidden_states_query[0]
-        last_hidden_states_key = hidden_states_key[0]
-
-        # delete the station_placeholder hidden_state:(N,1+L,D)->(N,L,D)
-        last_hidden_states_query = last_hidden_states_query[:, 1:]
-        last_hidden_states_key = last_hidden_states_key[:, 1:]
-
-        # hidden_state:(N,L,D)->(B,L,D)
-        query = last_hidden_states_query[::(neighbor_num + 1)]
-        key = last_hidden_states_key[::(neighbor_num + 1)]
-
-        if return_last_station_emb:
-            # B D
-            last_neighbor_hidden_states_query = hidden_states_query[-1]
-            last_neighbor_hidden_states_key = hidden_states_key[-1]
-
-            query = torch.cat([query[:, 0], last_neighbor_hidden_states_query], dim=-1)
-            query = self.graph_transform(query)
-            key = torch.cat([key[:, 0], last_neighbor_hidden_states_key], dim=-1)
-            key = self.graph_transform(key)
-
-        else:
-            query = query[:, 0]
-            key = key[:, 0]
-        neighbor_predict_loss = self.retrieve_loss(query, key)
-
-        return neighbor_predict_loss
