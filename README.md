@@ -12,7 +12,7 @@ transformers==3.4.0
 
 ## Usage
 ```
-python main_GraphFormers.py
+python main.py
 ```
 More parameter information please refer to `src/parameter.py`
 
