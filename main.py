@@ -4,7 +4,7 @@ from pathlib import Path
 import torch.multiprocessing as mp
 
 from src.parameters import parse_args
-from src.run_GraphFormers import train, test
+from src.run import train, test
 from src.utils import setuplogging
 
 if __name__ == "__main__":
