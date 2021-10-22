@@ -334,19 +334,6 @@ class GraphFormersForNeighborPredict(GraphTuringNLRPreTrainedModel):
         node_embeddings = cls_embeddings[:, 0, :]  # [B,D]
         return node_embeddings
 
-    def compute_acc(scores, labels):
-        # hit num
-        prediction = torch.argmax(scores, dim=-1)  # N L
-        hit = (prediction == labels).float()  # N　L
-        hit = torch.sum(hit)
-
-        # all num
-        labels = labels.masked_fill(labels >= 0, 1)
-        labels = labels.masked_fill(labels < 0, 0)
-        labels = torch.sum(labels)
-
-        return hit, labels
-
     def test(self, input_ids_query_and_neighbors_batch, attention_mask_query_and_neighbors_batch,
              mask_query_and_neighbors_batch, \
              input_ids_key_and_neighbors_batch, attention_mask_key_and_neighbors_batch, mask_key_and_neighbors_batch,
