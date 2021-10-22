@@ -3,12 +3,17 @@
 ## Introduction
 
 Implementation for [GraphFormers: GNN-nested Transformers for Representation Learning on Textual Graph](https://arxiv.org/abs/2105.02605)
+
 ## Requirements
 ```
 Python==3.6
 torch==1.6.0
 transformers==3.4.0
 ```
+
+##Data & Pretrained Language Model
+
+Please refer to [OneDrive](https://1drv.ms/u/s!Ag0vYLiCLJL3hTP91qvk1L61SzNn?e=tkjpqZ)
 
 ## Usage
 ```
