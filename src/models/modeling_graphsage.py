@@ -1,12 +1,14 @@
 import numpy as np
-from src.utils import roc_auc_score,mrr_score,ndcg_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.models.tnlrv3.modeling import TuringNLRv3PreTrainedModel,TuringNLRv3Model
+
+from src.models.tnlrv3.modeling import TuringNLRv3PreTrainedModel, TuringNLRv3Model
+from src.utils import roc_auc_score, mrr_score, ndcg_score
+
 
 class GraphSageMaxForNeighborPredict(TuringNLRv3PreTrainedModel):
-    def __init__(self,config):
+    def __init__(self, config):
         super().__init__(config)
         self.bert = TuringNLRv3Model(config)
         self.graph_transform = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
@@ -15,13 +17,13 @@ class GraphSageMaxForNeighborPredict(TuringNLRv3PreTrainedModel):
 
     def aggregation(self, neighbor_embed, neighbor_mask):
         neighbor_embed = F.relu(self.pooling_transform(neighbor_embed))
-        neighbor_embed = neighbor_embed.masked_fill(neighbor_mask.unsqueeze(2)==0,0)
-        return torch.max(neighbor_embed,dim=-2)[0]
+        neighbor_embed = neighbor_embed.masked_fill(neighbor_mask.unsqueeze(2) == 0, 0)
+        return torch.max(neighbor_embed, dim=-2)[0]
 
-    def graphsage(self,node_embed, node_mask):
+    def graphsage(self, node_embed, node_mask):
         neighbor_embed = node_embed[:, 1:]  # B N D
-        neighbor_mask = node_mask[:,1:] # B N
-        center_embed = node_embed[:,0] #B D
+        neighbor_mask = node_mask[:, 1:]  # B N
+        center_embed = node_embed[:, 0]  # B D
         neighbor_embed = self.aggregation(neighbor_embed, neighbor_mask)  # B D
         main_embed = torch.cat([center_embed, neighbor_embed], dim=-1)  # B 2D
         main_embed = self.graph_transform(main_embed)

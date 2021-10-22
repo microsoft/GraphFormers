@@ -34,19 +34,19 @@ def load_bert(args):
         args.config_name if args.config_name else args.model_name_or_path,
         output_hidden_states=True)
     config.neighbor_type = args.neighbor_type
-    if args.model_type=="GraphFormers":
+    if args.model_type == "GraphFormers":
         from src.models.modeling_graphformers import GraphFormersForNeighborPredict
         # model = GraphFormersForNeighborPredict(config)
         model = GraphFormersForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
-    elif args.model_type=="GraphSageMax":
+    elif args.model_type == "GraphSageMax":
         from src.models.modeling_graphsage import GraphSageMaxForNeighborPredict
-        model=GraphSageMaxForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
+        model = GraphSageMaxForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
     return model
 
 
 def train(local_rank, args, end, load):
     try:
-        if local_rank==0:
+        if local_rank == 0:
             from src.utils import setuplogging
             setuplogging()
         os.environ["RANK"] = str(local_rank)
