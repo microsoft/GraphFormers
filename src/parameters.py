@@ -19,14 +19,14 @@ def parse_args():
 
     parser.add_argument("--savename", type=str, default='GraphFormers')
     parser.add_argument("--world_size", type=int, default=8)
-    parser.add_argument("--neighbor_type", type=int, default=2)
-    parser.add_argument("--block_size", type=int, default=32)
+    parser.add_argument("--token_length", type=int, default=32)
     parser.add_argument("--neighbor_num", type=int, default=5)
 
     # model training
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--log_steps", type=int, default=1000)
-    parser.add_argument("--mlm_loss", type=utils.str2bool, default=False)
+    parser.add_argument("--mlm", type=utils.str2bool, default=False)
+    parser.add_argument("--random_seed", type=int, default=42)
 
     # turing
     parser.add_argument("--model_type", default="GraphFormers", type=str)
@@ -42,7 +42,7 @@ def parse_args():
         help="choose which ckpt to load and test"
     )
 
-    parser.add_argument("--pretrain_lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-5)
 
     # half float
     parser.add_argument("--fp16", type=utils.str2bool, default=True)

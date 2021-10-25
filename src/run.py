@@ -15,14 +15,14 @@ from src.data_handler import DatasetForMatching, DataCollatorForMatching, Single
 from src.models.tnlrv3.configuration_tnlrv3 import TuringNLRv3Config
 
 
-def setup(rank, world_size):
+def setup(rank, args):
     # initialize the process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size, )
+    dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
     torch.cuda.set_device(rank)
     # Explicitly setting seed
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+    torch.manual_seed(args.random_seed)
+    np.random.seed(args.random_seed)
+    random.seed(args.random_seed)
 
 
 def cleanup():
@@ -33,7 +33,6 @@ def load_bert(args):
     config = TuringNLRv3Config.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         output_hidden_states=True)
-    config.neighbor_type = args.neighbor_type
     if args.model_type == "GraphFormers":
         from src.models.modeling_graphformers import GraphFormersForNeighborPredict
         # model = GraphFormersForNeighborPredict(config)
@@ -50,7 +49,7 @@ def train(local_rank, args, end, load):
             from src.utils import setuplogging
             setuplogging()
         os.environ["RANK"] = str(local_rank)
-        setup(local_rank, args.world_size)
+        setup(local_rank, args)
         if args.fp16:
             from torch.cuda.amp import autocast
             scaler = torch.cuda.amp.GradScaler()
@@ -68,10 +67,10 @@ def train(local_rank, args, end, load):
         else:
             ddp_model = model
 
-        optimizer = optim.Adam([{'params': ddp_model.parameters(), 'lr': args.pretrain_lr}])
+        optimizer = optim.Adam([{'params': ddp_model.parameters(), 'lr': args.lr}])
 
-        data_collator = DataCollatorForMatching(mlm=args.mlm_loss, neighbor_num=args.neighbor_num,
-                                                token_length=args.block_size)
+        data_collator = DataCollatorForMatching(mlm=args.mlm, neighbor_num=args.neighbor_num,
+                                                token_length=args.token_length, random_seed=args.random_seed)
         loss = 0.0
         global_step = 0
         best_acc, best_count = 0.0, 0
@@ -171,8 +170,8 @@ def test_single_process(model, args, mode):
     assert mode in {"valid", "test"}
     model.eval()
 
-    data_collator = DataCollatorForMatching(mlm=args.mlm_loss, neighbor_num=args.neighbor_num,
-                                            token_length=args.block_size)
+    data_collator = DataCollatorForMatching(mlm=args.mlm, neighbor_num=args.neighbor_num,
+                                            token_length=args.token_length, random_seed=args.random_seed)
     if mode == "valid":
         dataset = DatasetForMatching(file_path=args.valid_data_path)
         dataloader = SingleProcessDataLoader(dataset, batch_size=args.valid_batch_size, collate_fn=data_collator)

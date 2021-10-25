@@ -82,12 +82,12 @@ class GraphTuringNLRPreTrainedModel(TuringNLRv3PreTrainedModel):
 
         # initialize new rel_pos weight
         _k = 'bert.rel_pos_bias.weight'
-        if _k in state_dict and state_dict[_k].shape[1] != (config.neighbor_type + config.rel_pos_bins):
+        if _k in state_dict and state_dict[_k].shape[1] != (config.rel_pos_bins + 2):
             logger.info(
-                f"rel_pos_bias.weight.shape[1]:{state_dict[_k].shape[1]} != config.bus_num+config.rel_pos_bins:{config.neighbor_type + config.rel_pos_bins}")
+                f"rel_pos_bias.weight.shape[1]:{state_dict[_k].shape[1]} != config.bus_num+config.rel_pos_bins:{config.rel_pos_bins + 2}")
             old_rel_pos_bias = state_dict[_k]
             new_rel_pos_bias = torch.cat(
-                [old_rel_pos_bias, old_rel_pos_bias[:, -1:].expand(old_rel_pos_bias.size(0), config.neighbor_type)], -1)
+                [old_rel_pos_bias, old_rel_pos_bias[:, -1:].expand(old_rel_pos_bias.size(0), 2)], -1)
             new_rel_pos_bias = nn.Parameter(data=new_rel_pos_bias, requires_grad=True)
             state_dict[_k] = new_rel_pos_bias.data
             del new_rel_pos_bias
@@ -111,17 +111,9 @@ class GraphAggregation(BertSelfAttention):
         self.output_attentions = False
 
     def forward(self, hidden_states, attention_mask=None, rel_pos=None):
-        """
-        hidden_states[:,0] for the center node, hidden_states[:,1:] for the neighbours
-        hidden_states: B SN D
-        attention_mask: B 1 1 SN
-        rel_pos:B Head_num 1 SN
-        """
-
         query = self.query(hidden_states[:, :1])  # B 1 D
         key = self.key(hidden_states)
         value = self.value(hidden_states)
-        # rel_pos=None
         station_embed = self.multi_head_attention(query=query,
                                                   key=key,
                                                   value=value,
@@ -140,58 +132,42 @@ class GraphBertEncoder(nn.Module):
         self.output_hidden_states = config.output_hidden_states
         self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
 
-        self.neighbor_type = config.neighbor_type  # config.neighbor_type:  0:No neighbors; 1-2;
-        if config.neighbor_type > 0:
-            self.graph_attention = GraphAggregation(config=config)
-            # self.graph_attention = nn.ModuleList([GraphAggregation(config=config) for _ in range(config.num_hidden_layers)])
+        self.graph_attention = GraphAggregation(config=config)
 
     def forward(self,
                 hidden_states,
                 attention_mask,
                 node_mask=None,
                 node_rel_pos=None,
-                rel_pos=None,
-                return_last_station_emb=False):
-        '''
-        Args:
-            hidden_states: N L D
-            attention_mask: N 1 1 L
-            node_mask: B 1 1 subgraph_node_num(SN)
-            node_rel_pos: B head_num 1 subgraph_node_num
-            rel_pos: N head_num L L
-        '''
+                rel_pos=None):
+
         all_hidden_states = ()
         all_attentions = ()
 
         all_nodes_num, seq_length, emb_dim = hidden_states.shape
-        if self.neighbor_type > 0:
-            batch_size, _, _, subgraph_node_num = node_mask.shape
+        batch_size, _, _, subgraph_node_num = node_mask.shape
 
         for i, layer_module in enumerate(self.layer):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.neighbor_type > 0:
-                if i > 0:
+            if i > 0:
 
-                    hidden_states = hidden_states.view(batch_size, subgraph_node_num, seq_length, emb_dim)  # B SN L D
-                    cls_emb = hidden_states[:, :, 1].clone()  # B SN D
-                    station_emb = self.graph_attention(hidden_states=cls_emb, attention_mask=node_mask,
-                                                       rel_pos=node_rel_pos)  # B D
-                    # station_emb = self.graph_attention[i-1](hidden_states=cls_emb, attention_mask=node_mask, rel_pos=node_rel_pos) #B D
+                hidden_states = hidden_states.view(batch_size, subgraph_node_num, seq_length, emb_dim)  # B SN L D
+                cls_emb = hidden_states[:, :, 1].clone()  # B SN D
+                station_emb = self.graph_attention(hidden_states=cls_emb, attention_mask=node_mask,
+                                                   rel_pos=node_rel_pos)  # B D
 
-                    # update the station in the query/key
-                    hidden_states[:, 0, 0] = station_emb
-                    hidden_states = hidden_states.view(all_nodes_num, seq_length, emb_dim)
+                # update the station in the query/key
+                hidden_states[:, 0, 0] = station_emb
+                hidden_states = hidden_states.view(all_nodes_num, seq_length, emb_dim)
 
-                    layer_outputs = layer_module(hidden_states, attention_mask=attention_mask, rel_pos=rel_pos)
-
-                else:
-                    temp_attention_mask = attention_mask.clone()
-                    temp_attention_mask[::subgraph_node_num, :, :, 0] = -10000.0
-                    layer_outputs = layer_module(hidden_states, attention_mask=temp_attention_mask, rel_pos=rel_pos)
-            else:
                 layer_outputs = layer_module(hidden_states, attention_mask=attention_mask, rel_pos=rel_pos)
+
+            else:
+                temp_attention_mask = attention_mask.clone()
+                temp_attention_mask[::subgraph_node_num, :, :, 0] = -10000.0
+                layer_outputs = layer_module(hidden_states, attention_mask=temp_attention_mask, rel_pos=rel_pos)
 
             hidden_states = layer_outputs[0]
 
@@ -207,15 +183,8 @@ class GraphBertEncoder(nn.Module):
             outputs = outputs + (all_hidden_states,)
         if self.output_attentions:
             outputs = outputs + (all_attentions,)
-        if return_last_station_emb:
-            hidden_states = hidden_states.view(batch_size, subgraph_node_num, seq_length, emb_dim)  # B SN L D
-            cls_emb = hidden_states[:, :, 1]  # B SN D
-            # station_emb = self.graph_attention[-1](hidden_states=cls_emb, attention_mask=node_mask,rel_pos=node_rel_pos) #B D
-            station_emb = self.graph_attention(hidden_states=cls_emb, attention_mask=node_mask,
-                                               rel_pos=node_rel_pos)  # B D
-            outputs = outputs + (station_emb,)
 
-        return outputs  # last-layer hidden state, (all hidden states), (all attentions), (station_emb)
+        return outputs  # last-layer hidden state, (all hidden states), (all attentions)
 
 
 class GraphFormers(TuringNLRv3PreTrainedModel):
@@ -226,7 +195,7 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
         self.encoder = GraphBertEncoder(config=config)
 
         if self.config.rel_pos_bins > 0:
-            self.rel_pos_bias = nn.Linear(self.config.rel_pos_bins + self.config.neighbor_type,
+            self.rel_pos_bias = nn.Linear(self.config.rel_pos_bins + 2,
                                           config.num_attention_heads,
                                           bias=False)
         else:
@@ -235,63 +204,46 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
     def forward(self,
                 input_ids,
                 attention_mask,
-                neighbor_mask=None,
-                return_last_station_emb=False):
-        '''
-        Args:
-            input_ids: Tensor(N:node_num,L:seq_length)
-            attention_mask: Tensor(N,L)
-            neighbor_mask: Tensor(B:batch_size, neighbor_num)
-
-        Retures:
-            last_hidden_state, (all hidden states), (all attentions), (station_emb)
-        '''
+                neighbor_mask=None):
         all_nodes_num, seq_length = input_ids.shape
         batch_size, subgraph_node_num = neighbor_mask.shape
 
         embedding_output, position_ids = self.embeddings(input_ids=input_ids)
 
-        attention_mask = attention_mask.type(embedding_output.dtype)
-        neighbor_mask = neighbor_mask.type(embedding_output.dtype)
-        node_mask = None
-        if self.config.neighbor_type > 0:
-            station_mask = torch.zeros(all_nodes_num, 1).type(attention_mask.dtype).to(attention_mask.device)  # N 1
-            attention_mask = torch.cat([station_mask, attention_mask], dim=-1)  # N 1+L
-            # only use the station for selfnode
-            attention_mask[::(subgraph_node_num), 0] = 1.0
+        # Add station attention mask
+        station_mask = torch.zeros((all_nodes_num, 1), dtype=attention_mask.dtype, device=attention_mask.device)
+        attention_mask = torch.cat([station_mask, attention_mask], dim=-1)  # N 1+L
+        attention_mask[::(subgraph_node_num), 0] = 1.0  # only use the station for main nodes
 
-            node_mask = (1.0 - neighbor_mask[:, None, None, :]) * -10000.0
-
+        node_mask = (1.0 - neighbor_mask[:, None, None, :]) * -10000.0
         extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
 
         if self.config.rel_pos_bins > 0:
-            node_rel_pos = None
             rel_pos_mat = position_ids.unsqueeze(-2) - position_ids.unsqueeze(-1)
             rel_pos = relative_position_bucket(rel_pos_mat, num_buckets=self.config.rel_pos_bins,
                                                max_distance=self.config.max_rel_pos)
 
-            if self.config.neighbor_type > 0:
-                # rel_pos: (N,L,L) -> (N,1+L,L)
-                temp_pos = torch.zeros(all_nodes_num, 1, seq_length, dtype=rel_pos.dtype, device=rel_pos.device)
-                rel_pos = torch.cat([temp_pos, rel_pos], dim=1)
-                # rel_pos: (N,1+L,L) -> (N,1+L,1+L)
-                station_relpos = torch.full((all_nodes_num, seq_length + 1, 1), self.config.rel_pos_bins,
-                                            dtype=rel_pos.dtype, device=rel_pos.device)
-                rel_pos = torch.cat([station_relpos, rel_pos], dim=-1)
+            # rel_pos: (N,L,L) -> (N,1+L,L)
+            temp_pos = torch.zeros(all_nodes_num, 1, seq_length, dtype=rel_pos.dtype, device=rel_pos.device)
+            rel_pos = torch.cat([temp_pos, rel_pos], dim=1)
+            # rel_pos: (N,1+L,L) -> (N,1+L,1+L)
+            station_relpos = torch.full((all_nodes_num, seq_length + 1, 1), self.config.rel_pos_bins,
+                                        dtype=rel_pos.dtype, device=rel_pos.device)
+            rel_pos = torch.cat([station_relpos, rel_pos], dim=-1)
 
-                # node_rel_pos:(B:batch_size, Head_num, neighbor_num+1)
-                node_pos = self.config.rel_pos_bins + self.config.neighbor_type - 1
-                node_rel_pos = torch.full((batch_size, subgraph_node_num), node_pos, dtype=rel_pos.dtype,
-                                          device=rel_pos.device)
-                node_rel_pos[:, 0] = 0
-                node_rel_pos = F.one_hot(node_rel_pos,
-                                         num_classes=self.config.rel_pos_bins + self.config.neighbor_type).type_as(
-                    embedding_output)
-                node_rel_pos = self.rel_pos_bias(node_rel_pos).permute(0, 2, 1)  # B head_num, neighbor_num
-                node_rel_pos = node_rel_pos.unsqueeze(2)  # B head_num 1 neighbor_num
+            # node_rel_pos:(B:batch_size, Head_num, neighbor_num+1)
+            node_pos = self.config.rel_pos_bins + 1
+            node_rel_pos = torch.full((batch_size, subgraph_node_num), node_pos, dtype=rel_pos.dtype,
+                                      device=rel_pos.device)
+            node_rel_pos[:, 0] = 0
+            node_rel_pos = F.one_hot(node_rel_pos,
+                                     num_classes=self.config.rel_pos_bins + 2).type_as(
+                embedding_output)
+            node_rel_pos = self.rel_pos_bias(node_rel_pos).permute(0, 2, 1)  # B head_num, neighbor_num
+            node_rel_pos = node_rel_pos.unsqueeze(2)  # B head_num 1 neighbor_num
 
             # rel_pos: (N,Head_num,1+L,1+L)
-            rel_pos = F.one_hot(rel_pos, num_classes=self.config.rel_pos_bins + self.config.neighbor_type).type_as(
+            rel_pos = F.one_hot(rel_pos, num_classes=self.config.rel_pos_bins + 2).type_as(
                 embedding_output)
             rel_pos = self.rel_pos_bias(rel_pos).permute(0, 3, 1, 2)
 
@@ -299,19 +251,17 @@ class GraphFormers(TuringNLRv3PreTrainedModel):
             node_rel_pos = None
             rel_pos = None
 
-        if self.config.neighbor_type > 0:
-            # Add station_placeholder
-            station_placeholder = torch.zeros(all_nodes_num, 1, embedding_output.size(-1)).type(
-                embedding_output.dtype).to(embedding_output.device)
-            embedding_output = torch.cat([station_placeholder, embedding_output], dim=1)  # N 1+L D
+        # Add station_placeholder
+        station_placeholder = torch.zeros(all_nodes_num, 1, embedding_output.size(-1)).type(
+            embedding_output.dtype).to(embedding_output.device)
+        embedding_output = torch.cat([station_placeholder, embedding_output], dim=1)  # N 1+L D
 
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
             node_mask=node_mask,
             node_rel_pos=node_rel_pos,
-            rel_pos=rel_pos,
-            return_last_station_emb=return_last_station_emb)
+            rel_pos=rel_pos)
 
         return encoder_outputs
 
