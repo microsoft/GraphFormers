@@ -30,7 +30,7 @@ def parse_args():
 
     # turing
     parser.add_argument("--model_type", default="GraphFormers", type=str)
-    parser.add_argument("--model_name_or_path", default="./TuringModels/base-uncased.bin", type=str,
+    parser.add_argument("--model_name_or_path", default="./TuringModels/graphformers-dblp.pt", type=str,
                         help="Path to pre-trained model or shortcut name. ")
     parser.add_argument("--config_name", default="./TuringModels/unilm2-base-uncased-config.json", type=str,
                         help="Pretrained config name or path if not the same as model_name")

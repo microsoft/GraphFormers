@@ -35,8 +35,9 @@ def load_bert(args):
         output_hidden_states=True)
     if args.model_type == "GraphFormers":
         from src.models.modeling_graphformers import GraphFormersForNeighborPredict
-        # model = GraphFormersForNeighborPredict(config)
-        model = GraphFormersForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
+        model = GraphFormersForNeighborPredict(config)
+        model.load_state_dict(torch.load(args.model_name_or_path, map_location="cpu")['model_state_dict'], strict=False)
+        # model = GraphFormersForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
     elif args.model_type == "GraphSageMax":
         from src.models.modeling_graphsage import GraphSageMaxForNeighborPredict
         model = GraphSageMaxForNeighborPredict.from_pretrained(args.model_name_or_path, config=config)
